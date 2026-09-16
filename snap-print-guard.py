@@ -42,9 +42,12 @@ import cups
 
 SNAP_SOCK = "/var/snap/cups/common/run/cups.sock"
 SYSTEM_SOCK = "/run/cups/cups.sock"
-DEFAULT_QUEUE = "HP_M283_DIRECT"
-DEFAULT_URI = "ipps://NPIC2312C.local:631/ipp/print"
-DEFAULT_TOKEN = "C2312C"   # see same_printer()
+# Written by `fix-snap-print.sh fix` into ~/.config/snap-print-guard.env and passed
+# in by the systemd unit (EnvironmentFile), so the queue the operator chose is the
+# queue the guard maintains. The literals are this box's printer.
+DEFAULT_QUEUE = os.environ.get("SPG_QUEUE") or "HP_M283_DIRECT"
+DEFAULT_URI = os.environ.get("SPG_URI") or "ipps://NPIC2312C.local:631/ipp/print"
+DEFAULT_TOKEN = os.environ.get("SPG_TOKEN") or "C2312C"   # see same_printer()
 QUEUE_INFO = "HP M283fdw (works from every app, incl. snap)"
 
 # proxy.c: char resource[32] holds "/" + name + NUL -> at most 30 name chars survive.
@@ -150,7 +153,11 @@ def held_by_cups_not_by_a_person(job):
     'no-hold' (measured: retry-held snap job 11 -> 'no-hold', reasons
     'resources-are-not-ready'). A person's hold sets a keyword or a time
     ('indefinite', 'night', '23:00', ...), and must be left alone."""
-    return job.get("job-hold-until", "no-hold") == "no-hold"
+    return job.get("job-hold-until") == "no-hold"  # attribute absent -> unknown -> hands off
+
+
+def held_by_a_person(job):
+    return job.get("job-state") == JOB_HELD and not held_by_cups_not_by_a_person(job)
 
 
 def label_of(job):
@@ -245,8 +252,10 @@ def mirror(sysc, snapc, queue, dry, state, now):
     log(f"mirror: snap cupsd has {queue} as {uri or 'nothing'} -> nudging cups-proxyd to re-clone it")
     if dry:
         return
-    subprocess.run(["lpadmin", "-h", SYSTEM_SOCK, "-p", queue, "-D", QUEUE_INFO],
-                   capture_output=True, text=True, timeout=60)
+    res = subprocess.run(["lpadmin", "-h", SYSTEM_SOCK, "-p", queue, "-D", QUEUE_INFO],
+                         capture_output=True, text=True, timeout=60)
+    if res.returncode != 0:
+        log(f"mirror: nudge failed rc={res.returncode}: {(res.stderr or res.stdout).strip()[:200]}")
 
 
 def stuck_in_snap(job, now):
@@ -260,9 +269,9 @@ def stuck_in_snap(job, now):
 
 
 def rescue(sysc, snapc, queue, token, dry, state, now):
-    if queue not in snapc.getPrinters():
-        log(f"rescue: {queue} not mirrored into the snap cupsd yet -> skipping this run")
-        return
+    # Without a mirror there is nowhere to move a job to, but a stuck job must
+    # still be announced (mirror() nudges cups-proxyd and reports nothing).
+    mirrored = queue in snapc.getPrinters()
     target = f"ipp://localhost/printers/{queue}"
     system_printers = sysc.getPrinters()
     jobs = snapc.getJobs(which_jobs="not-completed", requested_attributes=JOB_ATTRS)
@@ -290,6 +299,12 @@ def rescue(sysc, snapc, queue, token, dry, state, now):
                        f"{label} na {src} nie dotarł do drukarki: {why}. To inna drukarka niż {queue}, więc go nie przenoszę.",
                        dry)
             continue
+        if not mirrored:
+            if first_time(state, f"unmirrored-stuck:{jid}", now):
+                notify("Drukarka: wydruk utknął",
+                       f"{label} na {src} nie dotarł do drukarki, a zapasowej kolejki {queue} "
+                       f"nie ma jeszcze w aplikacjach snap: {msg or 'brak komunikatu'}", dry)
+            continue
         log(f"rescue: snap job {jid} on {src} state={job.get('job-state')} age={age}s msg={msg!r} -> {queue}")
         if dry:
             moved.append(label)
@@ -303,7 +318,7 @@ def rescue(sysc, snapc, queue, token, dry, state, now):
                 log(f"rescue: job {jid} changed state before the move -> leaving it")
                 continue
             snapc.moveJob(job_id=jid, job_printer_uri=target)
-        except cups.IPPError as exc:
+        except (cups.IPPError, cups.HTTPError) as exc:  # HTTPError: e.g. 401/403 from the cupsd
             log(f"rescue: job {jid} could not be moved: {exc}")
             if first_time(state, f"rescue-failed:{jid}", now):
                 notify("Drukarka: nie mogę przekierować wydruku", f"{label} ({src}): {exc}", dry)
@@ -315,7 +330,7 @@ def rescue(sysc, snapc, queue, token, dry, state, now):
                 # retry hold (measured: moved job 8 printed only when it expired).
                 # pycups has no releaseJob; job-hold-until=no-hold is the release.
                 snapc.setJobHoldUntil(jid, "no-hold")
-            except cups.IPPError as exc:
+            except (cups.IPPError, cups.HTTPError) as exc:
                 log(f"rescue: job {jid} moved but not released (prints when the hold expires): {exc}")
     if moved:
         notify("Drukarka: wydruk przekierowany",
@@ -327,7 +342,7 @@ def watch(sysc, queue, dry, state, now):
     jobs = sysc.getJobs(which_jobs="not-completed", requested_attributes=JOB_ATTRS)
     for jid in sorted(jobs):
         job = jobs[jid]
-        if queue_of(job) != queue or not held_by_cups_not_by_a_person(job):
+        if queue_of(job) != queue or held_by_a_person(job):
             continue
         state_value = job.get("job-state")
         age = age_of(job, now)

@@ -4,5 +4,7 @@ Documentation=https://github.com/prezis/snap-cups-direct-print
 
 [Service]
 Type=oneshot
+# Written by `fix-snap-print.sh fix`: SPG_QUEUE / SPG_URI / SPG_TOKEN. Optional.
+EnvironmentFile=-%h/.config/snap-print-guard.env
 ExecStart=/usr/bin/python3 %h/.local/bin/snap-print-guard
 Nice=10

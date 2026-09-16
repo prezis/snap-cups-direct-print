@@ -26,20 +26,25 @@
 #
 # USAGE
 #   ./fix-snap-print.sh diagnose                 # read-only health check
-#   ./fix-snap-print.sh fix [URI] [NAME]         # system queue + guard
+#   ./fix-snap-print.sh fix [URI] [NAME] [TOKEN] # system queue + guard
 #   ./fix-snap-print.sh install-guard            # (re)install the guard only
 #   ./fix-snap-print.sh uninstall-guard
 #   ./fix-snap-print.sh test [NAME]              # PRINTS A PAGE through the snap path
 #   ./fix-snap-print.sh remove NAME              # delete the system queue
 #
 #   URI  defaults to the first printer found by `driverless`
-#   NAME defaults to HP_M283_DIRECT (edit DEFAULT_NAME for another printer)
+#   NAME defaults to HP_M283_DIRECT; must be <= 30 characters
+#   TOKEN substring unique to this printer (e.g. serial), used so the guard only
+#         moves jobs between queues of the SAME device; default C2312C
+#   The choice is saved to ~/.config/snap-print-guard.env for the guard.
 set -u
 
 SNAP_SOCK=/var/snap/cups/common/run/cups.sock
 SYS_SOCK=/run/cups/cups.sock
 DEFAULT_NAME=HP_M283_DIRECT
+DEFAULT_TOKEN=C2312C   # serial suffix HP puts in both its hostname and DNS-SD name
 NAME_LIMIT=30
+GUARD_ENV="$HOME/.config/snap-print-guard.env"
 HERE=$(cd "$(dirname "$0")" && pwd)
 UNIT_DIR="$HOME/.config/systemd/user"
 GUARD_BIN="$HOME/.local/bin/snap-print-guard"
@@ -62,7 +67,11 @@ cmd_diagnose() {
   fi
   echo
   echo "== queues snap apps see, and whether the proxy can reach them =="
-  snap_lp lpstat -v 2>&1 | while read -r _ _ q uri; do
+  local queues
+  if ! queues=$(snap_lp lpstat -v 2>/dev/null); then
+    red "  cannot read the snap cupsd ($SNAP_SOCK) — is the cups snap running?"
+  fi
+  printf '%s\n' "$queues" | grep '^device for ' | while read -r _ _ q uri; do
     q=${q%:}; target=${uri##*/}
     case "$uri" in
       proxy://*) if [ "${#target}" -gt "$NAME_LIMIT" ]; then
@@ -75,8 +84,14 @@ cmd_diagnose() {
   done
   echo
   echo "== jobs waiting inside the snap cupsd (should be empty) =="
-  local jobs; jobs=$(snap_lp lpstat -l -o 2>&1)
-  if [ -z "$jobs" ]; then green "none"; else printf '%s\n' "$jobs" | head -20; fi
+  local jobs
+  if ! jobs=$(snap_lp lpstat -l -o 2>/dev/null); then
+    red "cannot list jobs on the snap cupsd"
+  elif [ -z "$jobs" ]; then
+    green "none"
+  else
+    printf '%s\n' "$jobs" | head -20
+  fi
   echo
   echo "== guard =="
   systemctl --user is-active snap-print-guard.timer >/dev/null 2>&1 \
@@ -87,16 +102,25 @@ cmd_diagnose() {
   timeout 15 driverless 2>/dev/null || warn "driverless found nothing (printer off / different subnet?)"
 }
 
+refuse_root() {
+  # The guard is a per-user service: under sudo it would land in /root and never run.
+  if [ "$(id -u)" -eq 0 ]; then
+    red "Run this as your normal desktop user, not root/sudo (it needs your lpadmin group and your session)."; exit 1
+  fi
+}
+
 cmd_install_guard() {
+  refuse_root
   if ! /usr/bin/python3 -c 'import cups' 2>/dev/null; then
     red "python3-cups (pycups) is missing: sudo apt install python3-cups"; exit 1
   fi
-  install -Dm755 "$HERE/snap-print-guard.py" "$GUARD_BIN"
-  install -Dm644 "$HERE/systemd/snap-print-guard.service" "$UNIT_DIR/snap-print-guard.service"
-  install -Dm644 "$HERE/systemd/snap-print-guard.timer"   "$UNIT_DIR/snap-print-guard.timer"
-  systemctl --user daemon-reload
-  systemctl --user enable --now snap-print-guard.timer
-  systemctl --user start snap-print-guard.service
+  install -Dm755 "$HERE/snap-print-guard.py" "$GUARD_BIN" \
+    && install -Dm644 "$HERE/systemd/snap-print-guard.service" "$UNIT_DIR/snap-print-guard.service" \
+    && install -Dm644 "$HERE/systemd/snap-print-guard.timer"   "$UNIT_DIR/snap-print-guard.timer" \
+    && systemctl --user daemon-reload \
+    && systemctl --user enable --now snap-print-guard.timer \
+    && systemctl --user start snap-print-guard.service \
+    || { red "Guard installation failed (see the error above)."; exit 1; }
   systemctl --user --no-pager status snap-print-guard.timer | head -4
   green "Guard installed. Logs: journalctl --user -u snap-print-guard"
 }
@@ -109,7 +133,17 @@ cmd_uninstall_guard() {
 }
 
 cmd_fix() {
-  local uri="${1:-}" name="${2:-$DEFAULT_NAME}"
+  refuse_root
+  local uri="${1:-}" name="${2:-$DEFAULT_NAME}" token="${3:-}"
+  if [ -z "$token" ]; then
+    if [ "$name" = "$DEFAULT_NAME" ]; then
+      token=$DEFAULT_TOKEN
+    else
+      token=$name
+      warn "No TOKEN given: stuck jobs are only moved from queues whose name contains '$token'."
+      warn "Pass a substring unique to this printer (e.g. its serial) as the 3rd argument to cover its auto-created queue."
+    fi
+  fi
   if [ "${#name}" -gt "$NAME_LIMIT" ]; then
     red "Queue name '$name' has ${#name} chars; the snap proxy keeps only $NAME_LIMIT."; exit 1
   fi
@@ -121,9 +155,12 @@ cmd_fix() {
   echo "Creating SYSTEM queue '$name' -> $uri"
   if ! sys_lp lpadmin -p "$name" -E -v "$uri" -m everywhere \
         -o printer-error-policy=retry-job -o printer-is-shared=false; then
-    red "lpadmin failed. Your user must be in the lpadmin group (or run this with sudo)."; exit 1
+    red "lpadmin failed. Your user must be in the lpadmin group: sudo usermod -aG lpadmin \$USER, then log in again."; exit 1
   fi
-  sys_lp lpadmin -d "$name"
+  sys_lp lpadmin -d "$name" || warn "could not make '$name' the default printer"
+  mkdir -p "$(dirname "$GUARD_ENV")"
+  printf 'SPG_QUEUE=%s\nSPG_URI=%s\nSPG_TOKEN=%s\n' "$name" "$uri" "$token" > "$GUARD_ENV"
+  echo "Guard settings -> $GUARD_ENV"
   echo "Waiting for cups-proxyd to mirror it into the snap…"
   for _ in $(seq 1 30); do
     snap_lp lpstat -v 2>/dev/null | grep -q "^device for $name: proxy://" && break
@@ -150,6 +187,12 @@ cmd_test() {
 cmd_remove() {
   local name="${1:-}"
   [ -z "$name" ] && { red "Usage: $0 remove NAME"; exit 1; }
+  local guarded=$DEFAULT_NAME
+  [ -f "$GUARD_ENV" ] && guarded=$(sed -n 's/^SPG_QUEUE=//p' "$GUARD_ENV")
+  if [ "$name" = "${guarded:-$DEFAULT_NAME}" ] && [ -f "$UNIT_DIR/snap-print-guard.timer" ]; then
+    warn "'$name' is the queue the guard maintains; removing the guard first, or it would recreate the queue within a minute."
+    cmd_uninstall_guard
+  fi
   sys_lp lpadmin -x "$name" && green "Removed system queue '$name' (cups-proxyd drops the mirror)."
 }
 
@@ -160,5 +203,5 @@ case "${1:-}" in
   uninstall-guard) cmd_uninstall_guard ;;
   test)            shift; cmd_test "$@" ;;
   remove)          shift; cmd_remove "$@" ;;
-  *) sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,/^set -u/p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

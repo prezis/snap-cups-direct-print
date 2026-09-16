@@ -88,7 +88,7 @@ In the browser's print dialog, pick the short queue **once**. Chromium remembers
 If you pick the long one later anyway, the guard moves the job within about 1–2 min
 and tells you.
 
-For another printer, set `DEFAULT_NAME` in `fix-snap-print.sh` and `DEFAULT_QUEUE`,
+For another printer: `./fix-snap-print.sh fix <URI> <NAME≤30> <TOKEN>`, where TOKEN is a substring unique to
 `DEFAULT_URI` and `DEFAULT_TOKEN` in `snap-print-guard.py`, or pass
 `--queue/--uri/--token` in the unit's `ExecStart`.
 
