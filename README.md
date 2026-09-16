@@ -48,8 +48,17 @@ that speaks IPP Everywhere **directly to the network printer**:
 chromium(snap) ──> snap cupsd ──> ipps://PRINTER:631/ipp/print ──> paper
 ```
 
-`cups-proxyd` only manages the queues it mirrors itself (it tags their PPDs), so it
-leaves the direct queue alone. The queue persists across reboots like any CUPS queue.
+The queue persists across reboots like any CUPS queue — **but NOT across a refresh of
+the `cups` snap.** Measured on this box: the queue created 2026-07-28 08:05 was
+`deleted by "root"` on 2026-07-31 22:53:43, the same second `/var/snap/cups/current`
+flipped from rev 1229 to 1238. From then on the browser silently fell back to the
+broken mirrored queue and Print went dead again (noticed 2026-09-16). After every
+cups snap refresh, run `./fix-snap-print.sh diagnose` and re-run `fix` if the
+`*_DIRECT` queue is missing. The queue is visible from the host with:
+
+```bash
+lpstat -h /var/snap/cups/common/run/cups.sock -v
+```
 
 ## Usage
 
@@ -81,9 +90,14 @@ Explicit URI / name:
   it anyway) — just don't pick it.
 - If your printer is USB-only, driverless discovery won't find it; this workaround
   targets network printers.
-- Rescuing a job already stuck in the snap queue: the document files live in
-  `/var/snap/cups/<rev>/var/spool/` (root-only) — copy the `d*` file out and
-  `lp` it to a working queue, then `cancel` the stuck job so it can't double-print.
+- Rescuing a job already stuck in the snap queue: no need to dig in the spool — move
+  it onto the direct queue and release the hold (as root):
+  ```bash
+  export CUPS_SERVER=/var/snap/cups/common/run/cups.sock
+  lpmove HP_Color_LaserJet_MFP_M283fdw_C2312C-6 HP_M283_DIRECT
+  lp -i 6 -H resume
+  ```
+  (verified 2026-09-16: the moved job went straight to the printer).
 
 ## License
 

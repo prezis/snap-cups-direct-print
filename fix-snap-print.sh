@@ -20,8 +20,9 @@
 #   Create a SECOND queue on the SNAP cupsd that talks IPP-Everywhere
 #   DIRECTLY to the network printer, skipping the broken proxy hop:
 #       chromium(snap) -> snap cupsd -> ipps://PRINTER:631 -> paper
-#   cups-proxyd only manages its own mirrored queues (it tags their PPDs),
-#   so it leaves the direct queue alone.
+#   The direct queue survives reboots but NOT a refresh of the cups snap:
+#   rev 1229->1238 (2026-07-31 22:53:43) deleted it, and printing silently
+#   fell back to the broken proxy queue. Re-run `diagnose` after a refresh.
 #
 # USAGE
 #   ./fix-snap-print.sh diagnose            # read-only health check
