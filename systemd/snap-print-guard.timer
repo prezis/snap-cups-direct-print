@@ -1,0 +1,11 @@
+[Unit]
+Description=Run snap-print-guard every minute
+Documentation=https://github.com/prezis/snap-cups-direct-print
+
+[Timer]
+OnStartupSec=20s
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

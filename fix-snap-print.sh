@@ -1,150 +1,164 @@
 #!/usr/bin/env bash
-# fix-snap-print.sh — diagnose & bypass the broken cups-snap proxy backend.
+# fix-snap-print.sh — make printing from snap browsers work, and keep it working.
 #
-# THE PROBLEM
-#   On systems with BOTH a classic (deb) CUPS daemon and the OpenPrinting
-#   `cups` snap (pulled in automatically by snap browsers like chromium),
-#   snap-confined apps print through the snap's own cupsd, which runs in
-#   "proxy mode": its queues forward jobs to the system cupsd via the
-#   /snap/cups/*/lib/cups/backend/proxy backend.
+# ROOT CAUSE (diagnosed 2026-09-16 from source + a live A/B on /dev/null queues)
+#   Snap apps (chromium, firefox) print into the `cups` SNAP's own cupsd, which
+#   forwards each job to the system cupsd through its `proxy` backend. That
+#   backend stores the target queue name in `char resource[32]`
+#   (OpenPrinting/cups-snap, cups-proxyd/proxy.c:53): names longer than 30
+#   characters are silently truncated, the queue is not found, and the job is
+#   held and retried forever with the misleading
+#       "Could not create job on the system's CUPS daemon - No such file or directory".
+#   cups-browsed names network printers after their DNS-SD name, which is often
+#   longer (HP_Color_LaserJet_MFP_M283fdw_C2312C = 36). Nothing is shown to you.
 #
-#   That backend can fail persistently with:
-#       "Could not create job on the system's CUPS daemon - No such file or directory"
-#   while root-owned cups-proxyd talks to the very same socket just fine.
-#   Result: you hit Print in chromium, the dialog closes, NOTHING happens,
-#   no error is shown, and the job sits invisible in the snap cupsd queue.
-#   Restarting the cups snap does NOT fix it (verified 2026-07-28,
-#   cups snap 2.4.19-2 rev 1229, Ubuntu 24.04).
-#
-# THE FIX (workaround)
-#   Create a SECOND queue on the SNAP cupsd that talks IPP-Everywhere
-#   DIRECTLY to the network printer, skipping the broken proxy hop:
-#       chromium(snap) -> snap cupsd -> ipps://PRINTER:631 -> paper
-#   The direct queue survives reboots but NOT a refresh of the cups snap:
-#   rev 1229->1238 (2026-07-31 22:53:43) deleted it, and printing silently
-#   fell back to the broken proxy queue. Re-run `diagnose` after a refresh.
+# THE FIX
+#   1. A PERMANENT queue with a SHORT name (<= 30 chars) on the SYSTEM cupsd.
+#      cups-proxyd mirrors every system queue into the snap on each start, so
+#      this survives snap refreshes and reboots.
+#      (The previous version of this tool created the queue inside the snap
+#      cupsd instead; cups-proxyd deletes such queues on its next start, which
+#      silently broke printing again after the 2026-07-31 snap refresh.)
+#   2. snap-print-guard, a systemd --user timer (every 60 s): recreates the
+#      queue if it disappears, moves jobs stuck on a broken queue of the SAME
+#      printer onto the short one, and shows a desktop notification whenever it
+#      acts or a job cannot print. No root needed.
 #
 # USAGE
-#   ./fix-snap-print.sh diagnose            # read-only health check
-#   ./fix-snap-print.sh fix [URI] [NAME]    # create direct queue (sudo)
-#   ./fix-snap-print.sh test [NAME]         # test print via the snap path
-#   ./fix-snap-print.sh remove [NAME]       # remove the direct queue (sudo)
+#   ./fix-snap-print.sh diagnose                 # read-only health check
+#   ./fix-snap-print.sh fix [URI] [NAME]         # system queue + guard
+#   ./fix-snap-print.sh install-guard            # (re)install the guard only
+#   ./fix-snap-print.sh uninstall-guard
+#   ./fix-snap-print.sh test [NAME]              # PRINTS A PAGE through the snap path
+#   ./fix-snap-print.sh remove NAME              # delete the system queue
 #
 #   URI  defaults to the first printer found by `driverless`
-#   NAME defaults to <printer-host>_DIRECT
+#   NAME defaults to HP_M283_DIRECT (edit DEFAULT_NAME for another printer)
 set -u
 
 SNAP_SOCK=/var/snap/cups/common/run/cups.sock
-SIG_ERROR="Could not create job on the system's CUPS daemon"
+SYS_SOCK=/run/cups/cups.sock
+DEFAULT_NAME=HP_M283_DIRECT
+NAME_LIMIT=30
+HERE=$(cd "$(dirname "$0")" && pwd)
+UNIT_DIR="$HOME/.config/systemd/user"
+GUARD_BIN="$HOME/.local/bin/snap-print-guard"
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 warn()  { printf '\033[33m%s\033[0m\n' "$*"; }
 
-snap_lpstat() { CUPS_SERVER="$SNAP_SOCK" lpstat "$@" 2>&1; }
-
-require_snap_cups() {
-  if ! snap list cups >/dev/null 2>&1; then
-    red "cups snap not installed — this tool targets the snap-proxy failure mode."
-    exit 1
-  fi
-  if [ ! -S "$SNAP_SOCK" ]; then
-    red "snap cupsd socket not found at $SNAP_SOCK"
-    exit 1
-  fi
-}
-
-discover_uri() {
-  # First driverless (IPP-Everywhere) printer on the network.
-  timeout 15 driverless 2>/dev/null | head -1
-}
-
-default_name() {
-  # ipps://NPIC2312C.local:631/ipp/print                          -> NPIC2312C_DIRECT
-  # ipps://HP%20Color%20LaserJet...(C2312C)._ipps._tcp.local/     -> HP_Color_LaserJet_C2312C_DIRECT-ish
-  local host
-  host=$(printf '%s' "$1" | sed -E 's#^[a-z]+://([^:/]+).*#\1#')
-  host=$(printf '%s' "$host" | sed -E 's/%[0-9A-Fa-f]{2}/_/g; s/\._ipps?\._tcp.*$//; s/\.local$//')
-  host=$(printf '%s' "$host" | tr -c 'A-Za-z0-9' '_' | sed -E 's/_+/_/g; s/^_+//; s/_+$//' | cut -c1-32)
-  printf '%s_DIRECT' "${host:-PRINTER}"
-}
+sys_lp()  { CUPS_SERVER="$SYS_SOCK" "$@"; }
+snap_lp() { CUPS_SERVER="$SNAP_SOCK" "$@"; }
 
 cmd_diagnose() {
-  require_snap_cups
-  echo "== snap cups =="
-  snap list cups | tail -1
-  pgrep -a cups-proxyd >/dev/null && green "cups-proxyd running (PROXY MODE: snap forwards to system cupsd)" \
-                                  || warn  "cups-proxyd not running (standalone mode)"
-  echo
-  echo "== system cupsd =="
-  if [ -S /run/cups/cups.sock ]; then green "system socket /run/cups/cups.sock present"; else warn "no system cupsd socket"; fi
-  echo
-  echo "== queues on the SNAP cupsd (what snap apps actually see) =="
-  snap_lpstat -v
-  echo
-  echo "== stuck jobs / signature error =="
-  local jobs; jobs=$(snap_lpstat -l -o)
-  if [ -z "$jobs" ]; then green "no jobs stuck in the snap queue"; else printf '%s\n' "$jobs" | head -20; fi
-  if printf '%s' "$jobs" | grep -q "$SIG_ERROR"; then
-    red  ">>> SIGNATURE ERROR PRESENT: the snap proxy backend is broken on this box."
-    red  ">>> Run: $0 fix"
+  echo "== cups snap =="
+  if snap list cups >/dev/null 2>&1; then
+    snap list cups | tail -1
+    pgrep -x cups-proxyd >/dev/null && green "cups-proxyd running (snap apps print through the proxy)" \
+                                    || warn  "cups-proxyd not running"
+  else
+    green "no cups snap — this failure mode does not apply"; return 0
   fi
   echo
-  echo "== driverless printers discovered on the network =="
+  echo "== queues snap apps see, and whether the proxy can reach them =="
+  snap_lp lpstat -v 2>&1 | while read -r _ _ q uri; do
+    q=${q%:}; target=${uri##*/}
+    case "$uri" in
+      proxy://*) if [ "${#target}" -gt "$NAME_LIMIT" ]; then
+                   red   "  BROKEN  $q  (system name has ${#target} chars > $NAME_LIMIT)"
+                 else
+                   green "  ok      $q"
+                 fi ;;
+      *)         warn  "  local   $q -> $uri (deleted by cups-proxyd on its next start)" ;;
+    esac
+  done
+  echo
+  echo "== jobs waiting inside the snap cupsd (should be empty) =="
+  local jobs; jobs=$(snap_lp lpstat -l -o 2>&1)
+  if [ -z "$jobs" ]; then green "none"; else printf '%s\n' "$jobs" | head -20; fi
+  echo
+  echo "== guard =="
+  systemctl --user is-active snap-print-guard.timer >/dev/null 2>&1 \
+    && green "snap-print-guard.timer active" || red "snap-print-guard.timer NOT active — run: $0 install-guard"
+  journalctl --user -u snap-print-guard -n 5 --no-pager 2>/dev/null | tail -5
+  echo
+  echo "== driverless printers on the network =="
   timeout 15 driverless 2>/dev/null || warn "driverless found nothing (printer off / different subnet?)"
 }
 
+cmd_install_guard() {
+  if ! /usr/bin/python3 -c 'import cups' 2>/dev/null; then
+    red "python3-cups (pycups) is missing: sudo apt install python3-cups"; exit 1
+  fi
+  install -Dm755 "$HERE/snap-print-guard.py" "$GUARD_BIN"
+  install -Dm644 "$HERE/systemd/snap-print-guard.service" "$UNIT_DIR/snap-print-guard.service"
+  install -Dm644 "$HERE/systemd/snap-print-guard.timer"   "$UNIT_DIR/snap-print-guard.timer"
+  systemctl --user daemon-reload
+  systemctl --user enable --now snap-print-guard.timer
+  systemctl --user start snap-print-guard.service
+  systemctl --user --no-pager status snap-print-guard.timer | head -4
+  green "Guard installed. Logs: journalctl --user -u snap-print-guard"
+}
+
+cmd_uninstall_guard() {
+  systemctl --user disable --now snap-print-guard.timer 2>/dev/null
+  rm -f "$UNIT_DIR/snap-print-guard.service" "$UNIT_DIR/snap-print-guard.timer" "$GUARD_BIN"
+  systemctl --user daemon-reload
+  green "Guard removed."
+}
+
 cmd_fix() {
-  require_snap_cups
-  local uri="${1:-}" name="${2:-}"
-  [ -z "$uri" ] && uri=$(discover_uri)
+  local uri="${1:-}" name="${2:-$DEFAULT_NAME}"
+  if [ "${#name}" -gt "$NAME_LIMIT" ]; then
+    red "Queue name '$name' has ${#name} chars; the snap proxy keeps only $NAME_LIMIT."; exit 1
+  fi
+  [ -z "$uri" ] && uri=$(timeout 15 driverless 2>/dev/null | head -1)
   if [ -z "$uri" ]; then
     red "No printer URI given and driverless discovery found nothing."
-    red "Usage: $0 fix ipps://<printer-host>:631/ipp/print [QUEUE_NAME]"
-    exit 1
+    red "Usage: $0 fix ipps://<printer-host>:631/ipp/print [NAME]"; exit 1
   fi
-  [ -z "$name" ] && name=$(default_name "$uri")
-  if [ "$(id -u)" -ne 0 ]; then
-    warn "lpadmin on the snap cupsd needs root — re-running with sudo…"
-    exec sudo "$0" fix "$uri" "$name"
+  echo "Creating SYSTEM queue '$name' -> $uri"
+  if ! sys_lp lpadmin -p "$name" -E -v "$uri" -m everywhere \
+        -o printer-error-policy=retry-job -o printer-is-shared=false; then
+    red "lpadmin failed. Your user must be in the lpadmin group (or run this with sudo)."; exit 1
   fi
-  echo "Creating direct queue '$name' -> $uri on the snap cupsd…"
-  export CUPS_SERVER="$SNAP_SOCK"
-  lpadmin -p "$name" -v "$uri" -m everywhere -o printer-is-shared=false
-  cupsenable "$name"
-  cupsaccept "$name"
-  lpstat -v "$name"
-  green "Done. In your snap browser's print dialog pick '$name' ONCE — it will be remembered."
+  sys_lp lpadmin -d "$name"
+  echo "Waiting for cups-proxyd to mirror it into the snap…"
+  for _ in $(seq 1 30); do
+    snap_lp lpstat -v 2>/dev/null | grep -q "^device for $name: proxy://" && break
+    sleep 1
+  done
+  snap_lp lpstat -v "$name" 2>&1
+  cmd_install_guard
+  green "Done. In the browser's print dialog choose '$name' once — it is remembered."
 }
 
 cmd_test() {
-  require_snap_cups
-  local name="${1:-}"
-  if [ -z "$name" ]; then
-    name=$(snap_lpstat -v | grep -o '^device for [A-Za-z0-9_]*_DIRECT' | head -1 | awk '{print $3}')
-  fi
-  if [ -z "$name" ]; then red "No *_DIRECT queue found — run '$0 fix' first."; exit 1; fi
-  echo "test print via snap socket -> $name — $(date '+%H:%M:%S')" | CUPS_SERVER="$SNAP_SOCK" lp -d "$name" || exit 1
-  echo "Waiting for completion…"
+  local name="${1:-$DEFAULT_NAME}"
+  warn "This prints a real page on '$name' through the snap path."
+  echo "snap-print test -> $name — $(date '+%H:%M:%S')" | snap_lp lp -d "$name" || exit 1
   for _ in $(seq 1 12); do
-    if [ -z "$(snap_lpstat -o | grep "^$name-")" ]; then green "COMPLETED — check the printer tray."; exit 0; fi
+    if [ -z "$(snap_lp lpstat -o 2>/dev/null | grep "^$name-")" ]; then
+      green "Left the snap layer — check the printer tray."; exit 0
+    fi
     sleep 5
   done
-  red "Job still queued after 60 s:"; snap_lpstat -l -o | head -8; exit 1
+  red "Still inside the snap cupsd after 60 s:"; snap_lp lpstat -l -o | head -8; exit 1
 }
 
 cmd_remove() {
-  require_snap_cups
   local name="${1:-}"
-  [ -z "$name" ] && { red "Usage: $0 remove QUEUE_NAME"; exit 1; }
-  if [ "$(id -u)" -ne 0 ]; then exec sudo "$0" remove "$name"; fi
-  CUPS_SERVER="$SNAP_SOCK" lpadmin -x "$name" && green "Removed '$name'."
+  [ -z "$name" ] && { red "Usage: $0 remove NAME"; exit 1; }
+  sys_lp lpadmin -x "$name" && green "Removed system queue '$name' (cups-proxyd drops the mirror)."
 }
 
 case "${1:-}" in
-  diagnose) cmd_diagnose ;;
-  fix)      shift; cmd_fix "$@" ;;
-  test)     shift; cmd_test "$@" ;;
-  remove)   shift; cmd_remove "$@" ;;
-  *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  diagnose)        cmd_diagnose ;;
+  fix)             shift; cmd_fix "$@" ;;
+  install-guard)   cmd_install_guard ;;
+  uninstall-guard) cmd_uninstall_guard ;;
+  test)            shift; cmd_test "$@" ;;
+  remove)          shift; cmd_remove "$@" ;;
+  *) sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

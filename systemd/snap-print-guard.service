@@ -1,0 +1,8 @@
+[Unit]
+Description=Keep printing from snap apps working (cups-snap proxy truncates queue names to 30 chars)
+Documentation=https://github.com/prezis/snap-cups-direct-print
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.local/bin/snap-print-guard
+Nice=10
