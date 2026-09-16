@@ -28,8 +28,9 @@ The backend reads the target queue name into a **32-byte buffer**
 ([`cups-snap/cups-proxyd/proxy.c:53`](https://github.com/OpenPrinting/cups-snap/blob/master/cups-proxyd/proxy.c),
 `char ... resource[32]`, holding `"/" + name + NUL`). **Any system queue name longer
 than 30 characters is silently truncated.** `cupsCreateJob()` then looks up a queue
-that does not exist and fails. The "No such file or directory" text is a stale
-`errno` left behind by that failed lookup, not a missing socket (that was a red
+that does not exist and fails. The "No such file or directory" text comes from that
+lookup itself: `cupsCreateJob()` reports a missing destination as `strerror(ENOENT)`
+(CUPS 2.4.x `cups/util.c:181-186`). It is not a missing socket (that was a red
 herring in the first version of this repo).
 
 cups-browsed names network printers after their DNS-SD service name, which is easily
@@ -104,6 +105,7 @@ Logs: `journalctl --user -u snap-print-guard`. The guard is silent unless it act
 
 ## Upstream
 
+Reported as [OpenPrinting/cups-snap#38](https://github.com/OpenPrinting/cups-snap/issues/38).
 The real fix belongs in `proxy.c`: size `resource` like `HTTP_MAX_URI`, as
 `cups-proxyd.c` already does for its own copy.
 
