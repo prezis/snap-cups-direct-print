@@ -88,9 +88,10 @@ In the browser's print dialog, pick the short queue **once**. Chromium remembers
 If you pick the long one later anyway, the guard moves the job within about 1–2 min
 and tells you.
 
-For another printer: `./fix-snap-print.sh fix <URI> <NAME≤30> <TOKEN>`, where TOKEN is a substring unique to
-`DEFAULT_URI` and `DEFAULT_TOKEN` in `snap-print-guard.py`, or pass
-`--queue/--uri/--token` in the unit's `ExecStart`.
+For another printer: `./fix-snap-print.sh fix <URI> <NAME≤30> <TOKEN>`. TOKEN is a
+substring unique to that device (e.g. its serial) that appears in its auto-created
+queue name or description. The choice is saved to `~/.config/snap-print-guard.env`,
+which the systemd unit passes to the guard.
 
 Logs: `journalctl --user -u snap-print-guard`. The guard is silent unless it acts.
 
